@@ -1,0 +1,459 @@
+#!/usr/bin/env python
+import json 
+import os 
+import sys 
+import subprocess
+import re
+
+IDL_TO_JSON_EXECUTABLE = './idl_to_json'
+
+def is_file_valid(filename):
+    if not os.path.isfile(filename):
+        print("Path {} does not designate a file".format(filename), file=sys.stderr)
+        raise Exception("Unable to find " + filename)
+    if not os.access(filename, os.R_OK):
+        print("File {} is not readable".format(filename), file=sys.stderr)
+        raise Exception("Unable to open " + filename)
+    if not os.path.isfile(IDL_TO_JSON_EXECUTABLE):
+        print("Path {} does not designate a file...run \"make\" to create it".format(IDL_TO_JSON_EXECUTABLE),file=sys.stderr)
+        raise Exception("No file named " + filename)
+    if not os.access(IDL_TO_JSON_EXECUTABLE, os.X_OK):
+        print("File {IDL_TO_JSON_EXECUTABLE} exists but is not executable",file=sys.stderr)
+        raise Exception("File " + IDL_TO_JSON_EXECUTABLE + " not executable")
+        
+
+
+class proxy_generator:
+
+    def __init__(self, idl_filename, decls):
+        self.idl_file = idl_filename
+        self.decls = decls
+        self.file = open(self.proxy_name(), 'a')
+        self.write_header()
+        self.write_functions()
+
+    def get_header(self):
+        return ["string", "cstdio", "cstring", "sstream", "rpcproxyhelper.h", "c150debug.h", "c150grading.h", self.idl_file]
+            
+    def proxy_name(self):
+        return self.idl_file[: self.idl_file.index(".")] + ".proxy.cpp" 
+    
+    def write_header(self):
+        header_list = list(map((lambda x: "#include \"" + x + "\"\n"), self.get_header()))
+        self.file.writelines(header_list)
+        self.file.write("\nusing namespace std;\n")
+        self.file.write("using namespace C150NETWORK;\n\n")
+    
+    def write_functions(self):
+        for name, sig in self.decls["functions"].items():
+            args = sig["arguments"]
+            type_args, name_args = self.generate_arg_string(args)
+            argstring = ', '.join([ty + ' ' + name for ty, name in zip(type_args, name_args)])
+            function_head = sig['return_type'] + " " + name + "(" + argstring + "){\n"
+            self.file.write(function_head)
+            self.send_func_name(name)
+            self.send_parameters(args)
+            self.recv_result(sig['return_type'])
+            self.file.write("}\n\n")
+
+    def generate_arg_string(self, args):
+        type_args, name_args = [], []
+        for a in args:
+            if (a["type"].startswith('__')):
+                var_type = re.findall(r'\_.*?\[', a["type"])[0][2:-1]
+                var_len = len(var_type)
+                bound = a["type"][2+var_len:]
+                type_args.append(var_type)
+                name_args.append(a["name"]+bound)
+            else:
+                type_args.append(a["type"])
+                name_args.append(a["name"])
+
+        return type_args, name_args
+
+    def send_func_name(self, function_name):
+        send_command = "\tc150debug->printf(C150RPCDEBUG,\"" + self.proxy_name() + ": " + function_name + "() invoked\");\n"
+        write_command = "\tRPCPROXYSOCKET->write(\"{}\", strlen(\"{}\")+1);\n".format(function_name, function_name) 
+        grade_command = "\t*GRADING << \"Invoking " + function_name + "()\" << endl;\n"
+        self.file.write(send_command)
+        self.file.write(write_command)
+        self.file.write(grade_command)
+
+    def send_parameters(self, args):
+        for param in args:
+            if param["type"] == "string":
+                self.file.write("\tsend_string(" + param["name"] + ");\n")
+            elif param["type"] == "int":
+                self.file.write("\tsend_int(" + param["name"] + ");\n")
+            elif param["type"] == "float":
+                self.file.write("\tsend_float(" + param["name"] + ");\n")
+            elif param["type"].startswith('__'):
+                # ARRAY
+                res = re.findall(r'\[.*?\]', param["type"])
+                res = [int(elt[1:-1]) for elt in res]
+                var_type = re.findall(r'\_.*?\[', param["type"])[0][2:-1]
+                self.send_array_param(param["name"], var_type, res, 0)
+            else:
+                #STRUCT
+                for type_name, sig in self.decls["types"].items():
+                    if type_name == param["type"]:
+                        self.send_struct_param(sig["members"], param["name"], 1, 0)
+
+    def send_array_param(self, var_name, var_type, bound, index_accum):
+        all_index_name = []
+        send_name = var_name
+        for index, bd in enumerate(bound):
+            index_name = "index_" + str(index_accum)
+            index_accum+=1
+            send_name += '[' + index_name + ']'
+            all_index_name.append(index_name)
+            self.file.write("\t"*(index + 1) + "for (int " + index_name + " = 0; " + index_name + " < " + str(bd) + "; " + index_name + "++){\n")
+        if (var_type == "string"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write("send_string(" + send_name + ");\n")
+        elif (var_type == "int"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write("send_int(" + send_name + ");\n")
+        elif (var_type == "float"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write("send_float(" + send_name + ");\n")
+        else:
+            for type_name, sig in self.decls["types"].items():
+                if type_name == var_type:
+                    self.send_struct_param(sig["members"], send_name, len(bound) + 1, index_accum)
+        
+        for index in range(len(bound)):
+            self.file.write("\t"* (len(bound) - index) + "}\n")
+        
+    def send_struct_param(self, args, struct_name, num_tab, index_accum):
+        for param in args:
+            curr_struct_obj = struct_name + '.' + param["name"]
+            if param["type"] == "string":
+                self.file.write("\t"*num_tab + "send_string(" + curr_struct_obj + ");\n")
+            elif param["type"] == "int":
+                self.file.write("\t"*num_tab + "send_int(" + curr_struct_obj + ");\n")
+            elif param["type"] == "float":
+                self.file.write("\t"*num_tab + "send_float(" + curr_struct_obj + ");\n")
+            elif param["type"].startswith('__'):
+                # ARRAY
+                res = re.findall(r'\[.*?\]', param["type"])
+                res = [int(elt[1:-1]) for elt in res]
+                var_type = re.findall(r'\_.*?\[', param["type"])[0][2:-1]
+                self.send_array_param(curr_struct_obj, var_type, res, index_accum)
+            else:
+                #STRUCT
+                for type_name, sig in self.decls["types"].items():
+                    if type_name == param["type"]:
+                        if (len(sig["members"]) != 0):
+                            self.send_struct_param(sig["members"], curr_struct_obj, num_tab, index_accum)
+
+    def recv_result(self, return_type):
+        if return_type != "void":
+            grade_command = "\t*GRADING << \"Receiving a value of type \'" + return_type + "\'\" << endl;\n"
+        else:
+            grade_command = "\t*GRADING << \"Void function do not expect a return value\" << endl;\n"
+        self.file.write(grade_command)
+        if return_type == "string":
+            self.file.write("\treturn recv_string();\n")
+        elif return_type == "int":
+            self.file.write("\treturn recv_int();\n")
+        elif return_type == "float":
+            self.file.write("\treturn recv_float();\n")
+        elif return_type == "void":
+            None
+        else:
+            #struct  
+            for type_name, sig in self.decls["types"].items():
+                if type_name == return_type:
+                    if (len(sig["members"]) != 0):
+                        struct_arg = []
+                        self.file.write("\t" + return_type + " " + "result" + ";\n")
+                        self.construct_struct_param_list(return_type, struct_arg, 0, 0, "result.", 0)
+                    else:
+                        self.file.write("\t" + return_type + " " + "result" + ";\n") # struct has no member 
+                    self.file.write("\treturn result;\n")
+
+    def construct_array_param(self, var_name, var_type, bound, firstcall, index_accum):
+        all_index_name = []
+        send_name = var_name
+        # declare the array variable
+        if firstcall:
+            bound_names = ['[' + str(elt) + ']' for elt in bound]
+            declaration_line = "\t" + var_type + " " + var_name + "".join(bound_names) + ";\n"
+            self.file.write(declaration_line)
+            
+        for index, bd in enumerate(bound):
+            index_name = "index_" + str(index_accum)
+            index_accum+=1
+            send_name += '[' + index_name + ']'
+            all_index_name.append(index_name)
+            self.file.write("\t"*(index + 1) + "for (int " + index_name + " = 0; " + index_name + " < " + str(bd) + "; " + index_name + "++){\n")
+
+        if (var_type == "string"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write(send_name + " = recv_string();\n")
+        elif (var_type == "int"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write(send_name + " = recv_int();\n")
+        elif (var_type == "float"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write(send_name + " = recv_float();\n")
+        else:
+            for type_name, sig in self.decls["types"].items():
+                if type_name == var_type:
+                    struct_arg = []
+                    self.construct_struct_param_list(var_type, struct_arg, 0, len(bound) + 1, send_name+".", index_accum)
+       
+        for index in range(len(bound)):
+            self.file.write("\t"* (len(bound) - index) + "}\n")
+            
+    def construct_struct_param_list(self, return_type, arg_list, param_num, tab_len, var_name_bound, index_accum):
+        tab_len = tab_len if tab_len > 0 else 1
+        for type_name, sig in self.decls["types"].items():
+            if return_type == type_name:
+                for param in sig["members"]:
+                    if param["type"] == "string":
+                        self.file.write("\t" * tab_len)
+                        self.file.write(var_name_bound + param["name"] + " = recv_string();\n")
+                    elif param["type"] == "int":
+                        self.file.write("\t" * tab_len)
+                        self.file.write(var_name_bound + param["name"] + " = recv_int();\n")
+                    elif param["type"] == "float":
+                        self.file.write("\t" * tab_len)
+                        self.file.write(var_name_bound + param["name"] + " = recv_float();\n")
+                    elif param["type"].startswith('__'):
+                        res = re.findall(r'\[.*?\]', param["type"])
+                        res = [int(elt[1:-1]) for elt in res]
+                        var_type = re.findall(r'\_.*?\[', param["type"])[0][2:-1]
+                        self.construct_array_param(var_name_bound+param["name"], var_type, res, False, index_accum)
+                    else:
+                        self.construct_struct_param_list(param["type"], arg_list, param_num, tab_len, var_name_bound+param["name"]+".", index_accum)
+
+
+class stub_generator:
+    def __init__(self, idl_filename, decls):
+        self.idl_file = idl_filename
+        self.decls = decls
+        self.file = open(self.stub_name(), 'a')
+        self.write_header()
+        self.write_functions()
+        self.write_dispatch_functions()
+
+    def get_header(self):
+        return ["string", "cstdio", "cstring", "sstream", "rpcstubhelper.h", "c150debug.h", "c150grading.h", self.idl_file]
+            
+    def stub_name(self):
+        return self.idl_file[: self.idl_file.index(".")] + ".stub.cpp" 
+    
+    def write_header(self):
+        header_list = list(map((lambda x: "#include \"" + x + "\"\n"), self.get_header()))
+        self.file.writelines(header_list)
+        self.file.write("\nusing namespace std;\n")
+        self.file.write("using namespace C150NETWORK;\n\n")
+
+    def write_dispatch_functions(self):
+        dispatch_function = """void dispatchFunction() { 
+    char functionNameBuffer[50];
+    getFunctionNameFromStream(functionNameBuffer, sizeof(functionNameBuffer));
+    if (!RPCSTUBSOCKET-> eof()) {
+        """
+        self.file.write(dispatch_function)
+        all_functionals_conditions = '\t\t}else '.join(self.list_dispatch_helper())
+        all_functionals_conditions += "\t\t}else\n\t\t\t__badFunction(functionNameBuffer);\n\t}\n}\n\n"
+        self.file.write(all_functionals_conditions)
+
+    def list_dispatch_helper(self):
+        function_calls = []
+        for name in self.decls['functions'].keys():
+            curr_func_call = "if (strcmp(functionNameBuffer, \"" + name + "\") == 0){\n"
+            curr_func_call += "\t\t\t*GRADING << \"Invoking " + name + "()\" << endl;\n" 
+            curr_func_call += "\t\t\t__" + name + "();\n"
+            function_calls.append(curr_func_call)
+        return function_calls
+            
+    def write_functions(self):
+        for name, sig in self.decls["functions"].items():
+            args = sig["arguments"]
+            function_head = "void __" + name + "(){\n"
+            self.file.write(function_head)
+            self.recv_parameters(args)
+            self.run_func(name, sig)
+            self.send_result(sig['return_type'])
+            self.file.write("}\n\n")
+
+    def recv_parameters(self, args):
+        for param in args:
+            if param["type"] == "string":
+                self.file.write("\tstring " + param["name"] + " = recv_string();\n")
+            elif param["type"] == "int":
+                self.file.write("\tint " + param["name"] + " = recv_int();\n")
+            elif param["type"] == "float":
+                self.file.write("\tfloat " + param["name"] + " = recv_float();\n")
+            elif param["type"].startswith('__'):
+                # ARRAY
+                res = re.findall(r'\[.*?\]', param["type"])
+                res = [int(elt[1:-1]) for elt in res]
+                var_type = re.findall(r'\_.*?\[', param["type"])[0][2:-1]
+                self.construct_array_param(param["name"], var_type, res, True, 0)
+            else:
+                #STRUCT
+                for type_name, sig in self.decls["types"].items():
+                    if type_name == param["type"]:
+                        if (len(sig["members"]) != 0):
+                            struct_arg = []
+                            self.file.write("\t" + param["type"] + " " + param["name"] + ";\n")
+                            self.construct_struct_param_list(param["type"], struct_arg, 0, 0, param["name"]+".", 0)
+                        else:
+                            self.file.write("\t" + param["type"] + " " + param["name"] + ";\n")
+
+    def construct_array_param(self, var_name, var_type, bound, firstcall, index_accum):
+        all_index_name = []
+        send_name = var_name
+        # declare the array variable
+        if firstcall:
+            bound_names = ['[' + str(elt) + ']' for elt in bound]
+            declaration_line = "\t" + var_type + " " + var_name + "".join(bound_names) + ";\n"
+            self.file.write(declaration_line)
+            
+        for index, bd in enumerate(bound):
+            index_name = "index_" + str(index_accum)
+            index_accum+=1
+            send_name += '[' + index_name + ']'
+            all_index_name.append(index_name)
+            self.file.write("\t"*(index + 1) + "for (int " + index_name + " = 0; " + index_name + " < " + str(bd) + "; " + index_name + "++){\n")
+
+        if (var_type == "string"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write(send_name + " = recv_string();\n")
+        elif (var_type == "int"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write(send_name + " = recv_int();\n")
+        elif (var_type == "float"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write(send_name + " = recv_float();\n")
+        else:
+            for type_name, sig in self.decls["types"].items():
+                if type_name == var_type:
+                    struct_arg = []
+                    self.construct_struct_param_list(var_type, struct_arg, 0, len(bound) + 1, send_name+".", index_accum)
+       
+        for index in range(len(bound)):
+            self.file.write("\t"* (len(bound) - index) + "}\n")
+            
+    def construct_struct_param_list(self, return_type, arg_list, param_num, tab_len, var_name_bound, index_accum):
+        tab_len = tab_len if tab_len > 0 else 1
+        for type_name, sig in self.decls["types"].items():
+            if return_type == type_name:
+                for param in sig["members"]:
+                    if param["type"] == "string":
+                        self.file.write("\t" * tab_len)
+                        self.file.write(var_name_bound + param["name"] + " = recv_string();\n")
+                    elif param["type"] == "int":
+                        self.file.write("\t" * tab_len)
+                        self.file.write(var_name_bound + param["name"] + " = recv_int();\n")
+                    elif param["type"] == "float":
+                        self.file.write("\t" * tab_len)
+                        self.file.write(var_name_bound + param["name"] + " = recv_float();\n")
+                    elif param["type"].startswith('__'):
+                        res = re.findall(r'\[.*?\]', param["type"])
+                        res = [int(elt[1:-1]) for elt in res]
+                        var_type = re.findall(r'\_.*?\[', param["type"])[0][2:-1]
+                        self.construct_array_param(var_name_bound+param["name"], var_type, res, False, index_accum)
+                    else:
+                        self.construct_struct_param_list(param["type"], arg_list, param_num, tab_len, var_name_bound+param["name"]+".", index_accum)
+    
+    def run_func(self, name, sig):
+        args = sig["arguments"]
+        argstring = "(" + ', '.join([a["name"] for a in args]) + ");\n"
+        if (sig['return_type'] == 'void'):
+            func_call_line = "\t" + name + argstring
+        else:
+            func_call_line = "\t" + sig['return_type'] + " result = " + name + argstring
+        self.file.write(func_call_line)
+
+    def send_result(self, return_type):
+        if return_type != "void":
+            grade_command = "\t*GRADING << \"Sending a value of type \'" + return_type + "\'\" << endl;\n"
+        else:
+            grade_command = "\t*GRADING << \"Void function do not send a return value\" << endl;\n"
+        self.file.write(grade_command)
+        if return_type == "string":
+            self.file.write("\tsend_string(result);\n")
+        elif return_type == "int":
+            self.file.write("\tsend_int(result);\n")
+        elif return_type == "float":
+            self.file.write("\tsend_float(result);\n")
+        elif return_type == "void":
+            None
+        else: 
+            #STRUCT
+            for type_name, sig in self.decls["types"].items():
+                if type_name == return_type:
+                    self.send_struct_result(sig["members"], "result")
+
+    def send_struct_result(self, args, struct_name):
+        for param in args:
+            if param["type"] == "string":
+                self.file.write("\tsend_string(" + struct_name + '.' + param["name"] + ");\n")
+            elif param["type"] == "int":
+                self.file.write("\tsend_int(" + struct_name + '.' + param["name"] + ");\n")
+            elif param["type"] == "float":
+                self.file.write("\tsend_float(" + struct_name + '.' + param["name"] + ");\n")
+            elif param["type"].startswith('__'):
+                # ARRAY
+                res = re.findall(r'\[.*?\]', param["type"])
+                res = [int(elt[1:-1]) for elt in res]
+                var_type = re.findall(r'\_.*?\[', param["type"])[0][2:-1]
+                self.send_array_param(struct_name + '.' + param["name"], var_type, res, 0)
+            else:
+                #STRUCT
+                for type_name, sig in self.decls["types"].items():
+                    if type_name == param["type"]:
+                        next_level_struct = struct_name + '.' + param["name"]
+                        self.send_struct_result(sig["members"], next_level_struct)
+
+    def send_array_param(self, var_name, var_type, bound, index_accum):
+        all_index_name = []
+        send_name = var_name
+        for index, bd in enumerate(bound):
+            index_name = "index_" + str(index_accum)
+            index_accum+=1
+            send_name += '[' + index_name + ']'
+            all_index_name.append(index_name)
+            self.file.write("\t"*(index + 1) + "for (int " + index_name + " = 0; " + index_name + " < " + str(bd) + "; " + index_name + "++){\n")
+        if (var_type == "string"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write("send_string(" + send_name + ");\n")
+        elif (var_type == "int"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write("send_int(" + send_name + ");\n")
+        elif (var_type == "float"):
+            self.file.write("\t"*(len(bound) + 1))
+            self.file.write("send_float(" + send_name + ");\n")
+        else:
+            for type_name, sig in self.decls["types"].items():
+                if type_name == var_type:
+                    self.send_struct_param(sig["members"], send_name, len(bound) + 1)
+        
+        for index in range(len(bound)):
+            self.file.write("\t"* (len(bound) - index) + "}\n")
+        
+
+
+
+
+def main():
+    
+    input_idl = sys.argv[1]
+    is_file_valid(input_idl)
+
+    #     Parse declarations into a Python dictionary
+    decls = json.loads(subprocess.check_output([IDL_TO_JSON_EXECUTABLE, input_idl]))
+
+    proxy = proxy_generator(input_idl, decls)
+    stub = stub_generator(input_idl, decls)
+    
+    
+
+if __name__ == "__main__":
+    main()
